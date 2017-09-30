@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"errors"
+	"fmt"
 )
 
 const (
@@ -343,13 +344,14 @@ func (s *Session) keepalive() {
 
 func (s *Session) sendLoop() {
 	buf := make([]byte, (1<<16)+headerSize)
-	queue := make(chan writeRequest, 128)
-	var lastSid uint32 = 0
 
-//	streamQueues = make(map[uint32](chan writeRequest))
+	streamQueues := make(map[uint32](chan writeRequest))
+	writeNotify := make(chan struct{}, 1)
 
-	writes := make(chan writeRequest, 8)
+	writes := make(chan writeRequest, 1)
 	go func() {
+		fmt.Println("[sendLoop][real writes]start...")
+		defer fmt.Println("[sendLoop][real writes]end...")
 		for {
 			select {
 			case <-s.die:
@@ -382,6 +384,49 @@ func (s *Session) sendLoop() {
 		}
 	}()
 
+	go func() {
+		fmt.Println("[sendLoop][round robin]start...")
+		defer fmt.Println("[sendLoop][round robin]end...")
+		for {
+			select {
+			case <-s.die:
+				return
+			case <-writeNotify:
+				for {
+					sids := make([]uint32, 0)
+					for sid, _ := range streamQueues {
+						sids = append(sids, sid)
+					}
+
+					i := 0
+					lim := len(sids)
+					for _, sid := range sids {
+						if queue, ok := streamQueues[sid]; ok {
+							select {
+							case request, ok := <-queue:
+								if !ok {
+									continue
+								}
+								if request.frame.cmd == cmdFIN {
+									delete(streamQueues, sid)
+								}
+								writes <- request
+							default:
+								i++
+							}
+						}else{
+							i++
+						}
+					}
+					if i == lim {
+fmt.Println("[sendLoop][robin][all empty]", i, lim, len(streamQueues))
+						break
+					}
+				}
+			}
+		}
+	}()
+
 	for {
 		var request writeRequest
 		var ok bool
@@ -392,37 +437,60 @@ func (s *Session) sendLoop() {
 			if !ok {
 				continue
 			}
-			if request.frame.cmd == cmdPSH {
-				if lastSid == request.frame.sid {
+
+			f := request.frame
+			switch f.cmd {
+			case cmdSYN:
+				if _, ok := streamQueues[f.sid]; !ok {
+					queue := make(chan writeRequest, 128)
+					streamQueues[f.sid] = queue
+					queue <- request
+fmt.Println("[sendLoop][new connect]", f.sid, len(streamQueues))
+				}
+			case cmdFIN:
+				if queue, ok := streamQueues[f.sid]; ok {
 					select {
 					case queue <- request:
-						continue
 					default:
-						request, ok = <-queue
+//						request2, ok2 := <-queue
+						request2 := <-queue
+						queue <- request
+//						request, ok = request2, ok2
+						writes <- request2
 					}
 				}
-				lastSid = request.frame.sid
-			}
 
-			// get cmdFIN but queue have data
-			if request.frame.cmd == cmdFIN && lastSid == request.frame.sid {
-				lastSid = 0
+			case cmdFUL:
+				fallthrough
+			case cmdEMP:
+				fallthrough
+			case cmdPSH:
+				queue, ok := streamQueues[f.sid]
+				if !ok {
+					queue = make(chan writeRequest, 128)
+					streamQueues[f.sid] = queue
+fmt.Println("[sendLoop][new connect2]", f.sid, len(streamQueues))
+				}
 				select {
 				case queue <- request:
-					continue
 				default:
-					request2, ok2 := <-queue
-					queue <- request
-					request, ok = request2, ok2
+//					request, ok = <-queue
+					writes <- request
 				}
+
+			default:
+fmt.Println("[sendLoop][force writes]", f.sid, f.cmd)
+				writes <- request
+				continue
 			}
-		case request, ok = <-queue:
+
+fmt.Println("[sendLoop][trigger robin]", f.sid, f.cmd)
+			select {
+			case writeNotify <- struct{}{}:
+			default:
+			}
 		}
 
-		if !ok {
-			continue
-		}
-		writes <- request
 	}
 }
 
