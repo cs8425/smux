@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"runtime"
 
 	"errors"
 )
@@ -139,6 +140,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 			return sent, errTimeout
 		}
 
+		runtime.Gosched()
+
 		select {
 		case result := <-req.result:
 			sent += result.n
@@ -150,6 +153,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 		case <-deadline:
 			return sent, errTimeout
 		}
+
+		runtime.Gosched()
 	}
 	return sent, nil
 }

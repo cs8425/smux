@@ -343,34 +343,86 @@ func (s *Session) keepalive() {
 
 func (s *Session) sendLoop() {
 	buf := make([]byte, (1<<16)+headerSize)
+	queue := make(chan writeRequest, 128)
+	var lastSid uint32 = 0
+
+//	streamQueues = make(map[uint32](chan writeRequest))
+
+	writes := make(chan writeRequest, 8)
+	go func() {
+		for {
+			select {
+			case <-s.die:
+				return
+			case request, ok := <-writes:
+				if !ok {
+					continue
+				}
+
+				buf[0] = request.frame.ver
+				buf[1] = request.frame.cmd
+				binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
+				binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
+				copy(buf[headerSize:], request.frame.data)
+				n, err := s.conn.Write(buf[:headerSize+len(request.frame.data)])
+
+				n -= headerSize
+				if n < 0 {
+					n = 0
+				}
+
+				result := writeResult{
+					n:   n,
+					err: err,
+				}
+
+				request.result <- result
+				close(request.result)
+			}
+		}
+	}()
+
 	for {
+		var request writeRequest
+		var ok bool
 		select {
 		case <-s.die:
 			return
-		case request, ok := <-s.writes:
+		case request, ok = <-s.writes:
 			if !ok {
 				continue
 			}
-			buf[0] = request.frame.ver
-			buf[1] = request.frame.cmd
-			binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
-			binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
-			copy(buf[headerSize:], request.frame.data)
-			n, err := s.conn.Write(buf[:headerSize+len(request.frame.data)])
-
-			n -= headerSize
-			if n < 0 {
-				n = 0
+			if request.frame.cmd == cmdPSH {
+				if lastSid == request.frame.sid {
+					select {
+					case queue <- request:
+						continue
+					default:
+						request, ok = <-queue
+					}
+				}
+				lastSid = request.frame.sid
 			}
 
-			result := writeResult{
-				n:   n,
-				err: err,
+			// get cmdFIN but queue have data
+			if request.frame.cmd == cmdFIN && lastSid == request.frame.sid {
+				lastSid = 0
+				select {
+				case queue <- request:
+					continue
+				default:
+					request2, ok2 := <-queue
+					queue <- request
+					request, ok = request2, ok2
+				}
 			}
-
-			request.result <- result
-			close(request.result)
+		case request, ok = <-queue:
 		}
+
+		if !ok {
+			continue
+		}
+		writes <- request
 	}
 }
 
