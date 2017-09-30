@@ -9,7 +9,6 @@ import (
 	"sort"
 
 	"errors"
-//	"log"
 )
 
 const (
@@ -346,9 +345,11 @@ func (s *Session) keepalive() {
 func (s *Session) sendLoop() {
 	buf := make([]byte, (1<<16)+headerSize)
 	QueueSize := 1024
+
 	var queueLock sync.Mutex
 	streamQueues := make(map[uint32](chan writeRequest))
 	writeNotify := make(chan struct{}, 1)
+	var reqCount int32 = 0
 
 	writes := make(chan writeRequest, 1)
 	go func() {
@@ -390,7 +391,7 @@ func (s *Session) sendLoop() {
 			case <-s.die:
 				return
 			case <-writeNotify:
-				for {
+				for atomic.LoadInt32(&reqCount) > 0 {
 					sids := make([]uint32, 0)
 					queueLock.Lock()
 					for sid, _ := range streamQueues {
@@ -400,7 +401,6 @@ func (s *Session) sendLoop() {
 
 					sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
 
-					rem := 0
 					for _, sid := range sids {
 						queueLock.Lock()
 						if queue, ok := streamQueues[sid]; ok {
@@ -417,16 +417,12 @@ func (s *Session) sendLoop() {
 									queueLock.Unlock()
 								}
 								writes <- request
+								atomic.AddInt32(&reqCount, -1)
 							default:
 							}
-							rem += len(queue)
 						} else {
 							queueLock.Unlock()
 						}
-					}
-					if rem == 0 {
-//log.Println("[sendLoop][robin][all empty]", rem, len(streamQueues))
-						break
 					}
 				}
 			}
@@ -448,15 +444,16 @@ func (s *Session) sendLoop() {
 			switch f.cmd {
 			case cmdSYN:
 				queueLock.Lock()
-				if _, ok := streamQueues[f.sid]; !ok {
-					queue := make(chan writeRequest, QueueSize)
+				queue, ok := streamQueues[f.sid]
+				if !ok {
+					queue = make(chan writeRequest, QueueSize)
 					streamQueues[f.sid] = queue
-					queueLock.Unlock()
-
-					queue <- request
-				} else {
-					queueLock.Unlock()
 				}
+				queueLock.Unlock()
+
+				queue <- request
+				atomic.AddInt32(&reqCount, 1)
+
 			case cmdFIN:
 				queueLock.Lock()
 				if queue, ok := streamQueues[f.sid]; ok {
@@ -464,6 +461,7 @@ func (s *Session) sendLoop() {
 
 					select {
 					case queue <- request:
+						atomic.AddInt32(&reqCount, 1)
 					default:
 						// queue full
 						request2 := <-queue
@@ -472,6 +470,7 @@ func (s *Session) sendLoop() {
 					}
 				} else {
 					queueLock.Unlock()
+					writes <- request
 				}
 /*			case cmdFUL:
 				fallthrough
@@ -488,6 +487,7 @@ func (s *Session) sendLoop() {
 
 				select {
 				case queue <- request:
+					atomic.AddInt32(&reqCount, 1)
 				default:
 					// queue full
 					request2 := <-queue
