@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+//	"math/rand"
+	"sort"
 
 	"errors"
 	"fmt"
@@ -387,6 +389,7 @@ func (s *Session) sendLoop() {
 	go func() {
 		fmt.Println("[sendLoop][round robin]start...")
 		defer fmt.Println("[sendLoop][round robin]end...")
+//		rand.Seed(time.Now().UnixNano())
 		for {
 			select {
 			case <-s.die:
@@ -397,6 +400,13 @@ func (s *Session) sendLoop() {
 					for sid, _ := range streamQueues {
 						sids = append(sids, sid)
 					}
+
+/*					// shuffle
+					for i := range sids {
+						j := rand.Intn(i + 1)
+						sids[i], sids[j] = sids[j], sids[i]
+					}*/
+					sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
 
 					i := 0
 					lim := len(sids)
@@ -442,7 +452,7 @@ fmt.Println("[sendLoop][robin][all empty]", i, lim, len(streamQueues))
 			switch f.cmd {
 			case cmdSYN:
 				if _, ok := streamQueues[f.sid]; !ok {
-					queue := make(chan writeRequest, 128)
+					queue := make(chan writeRequest, 512)
 					streamQueues[f.sid] = queue
 					queue <- request
 fmt.Println("[sendLoop][new connect]", f.sid, len(streamQueues))
@@ -452,10 +462,9 @@ fmt.Println("[sendLoop][new connect]", f.sid, len(streamQueues))
 					select {
 					case queue <- request:
 					default:
-//						request2, ok2 := <-queue
+						// queue full
 						request2 := <-queue
 						queue <- request
-//						request, ok = request2, ok2
 						writes <- request2
 					}
 				}
@@ -467,24 +476,26 @@ fmt.Println("[sendLoop][new connect]", f.sid, len(streamQueues))
 			case cmdPSH:
 				queue, ok := streamQueues[f.sid]
 				if !ok {
-					queue = make(chan writeRequest, 128)
+					queue = make(chan writeRequest, 512)
 					streamQueues[f.sid] = queue
 fmt.Println("[sendLoop][new connect2]", f.sid, len(streamQueues))
 				}
 				select {
 				case queue <- request:
 				default:
-//					request, ok = <-queue
-					writes <- request
+					// queue full
+					request2 := <-queue
+					queue <- request
+					writes <- request2
 				}
 
 			default:
-fmt.Println("[sendLoop][force writes]", f.sid, f.cmd)
+//fmt.Println("[sendLoop][force writes]", f.sid, f.cmd)
 				writes <- request
 				continue
 			}
 
-fmt.Println("[sendLoop][trigger robin]", f.sid, f.cmd)
+//fmt.Println("[sendLoop][trigger robin]", f.sid, f.cmd)
 			select {
 			case writeNotify <- struct{}{}:
 			default:
