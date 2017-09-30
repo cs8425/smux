@@ -6,11 +6,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-//	"math/rand"
 	"sort"
 
 	"errors"
-	"fmt"
+//	"log"
 )
 
 const (
@@ -346,14 +345,13 @@ func (s *Session) keepalive() {
 
 func (s *Session) sendLoop() {
 	buf := make([]byte, (1<<16)+headerSize)
-
+	QueueSize := 1024
+	var queueLock sync.Mutex
 	streamQueues := make(map[uint32](chan writeRequest))
 	writeNotify := make(chan struct{}, 1)
 
 	writes := make(chan writeRequest, 1)
 	go func() {
-		fmt.Println("[sendLoop][real writes]start...")
-		defer fmt.Println("[sendLoop][real writes]end...")
 		for {
 			select {
 			case <-s.die:
@@ -387,9 +385,6 @@ func (s *Session) sendLoop() {
 	}()
 
 	go func() {
-		fmt.Println("[sendLoop][round robin]start...")
-		defer fmt.Println("[sendLoop][round robin]end...")
-//		rand.Seed(time.Now().UnixNano())
 		for {
 			select {
 			case <-s.die:
@@ -397,39 +392,40 @@ func (s *Session) sendLoop() {
 			case <-writeNotify:
 				for {
 					sids := make([]uint32, 0)
+					queueLock.Lock()
 					for sid, _ := range streamQueues {
 						sids = append(sids, sid)
 					}
+					queueLock.Unlock()
 
-/*					// shuffle
-					for i := range sids {
-						j := rand.Intn(i + 1)
-						sids[i], sids[j] = sids[j], sids[i]
-					}*/
 					sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
 
-					i := 0
-					lim := len(sids)
+					rem := 0
 					for _, sid := range sids {
+						queueLock.Lock()
 						if queue, ok := streamQueues[sid]; ok {
+							queueLock.Unlock()
+
 							select {
 							case request, ok := <-queue:
 								if !ok {
 									continue
 								}
 								if request.frame.cmd == cmdFIN {
+									queueLock.Lock()
 									delete(streamQueues, sid)
+									queueLock.Unlock()
 								}
 								writes <- request
 							default:
-								i++
 							}
-						}else{
-							i++
+							rem += len(queue)
+						} else {
+							queueLock.Unlock()
 						}
 					}
-					if i == lim {
-fmt.Println("[sendLoop][robin][all empty]", i, lim, len(streamQueues))
+					if rem == 0 {
+//log.Println("[sendLoop][robin][all empty]", rem, len(streamQueues))
 						break
 					}
 				}
@@ -451,14 +447,21 @@ fmt.Println("[sendLoop][robin][all empty]", i, lim, len(streamQueues))
 			f := request.frame
 			switch f.cmd {
 			case cmdSYN:
+				queueLock.Lock()
 				if _, ok := streamQueues[f.sid]; !ok {
-					queue := make(chan writeRequest, 512)
+					queue := make(chan writeRequest, QueueSize)
 					streamQueues[f.sid] = queue
+					queueLock.Unlock()
+
 					queue <- request
-fmt.Println("[sendLoop][new connect]", f.sid, len(streamQueues))
+				} else {
+					queueLock.Unlock()
 				}
 			case cmdFIN:
+				queueLock.Lock()
 				if queue, ok := streamQueues[f.sid]; ok {
+					queueLock.Unlock()
+
 					select {
 					case queue <- request:
 					default:
@@ -467,19 +470,22 @@ fmt.Println("[sendLoop][new connect]", f.sid, len(streamQueues))
 						queue <- request
 						writes <- request2
 					}
+				} else {
+					queueLock.Unlock()
 				}
-
-			case cmdFUL:
+/*			case cmdFUL:
 				fallthrough
 			case cmdEMP:
-				fallthrough
+				fallthrough*/
 			case cmdPSH:
+				queueLock.Lock()
 				queue, ok := streamQueues[f.sid]
 				if !ok {
-					queue = make(chan writeRequest, 512)
+					queue = make(chan writeRequest, QueueSize)
 					streamQueues[f.sid] = queue
-fmt.Println("[sendLoop][new connect2]", f.sid, len(streamQueues))
 				}
+				queueLock.Unlock()
+
 				select {
 				case queue <- request:
 				default:
@@ -490,12 +496,10 @@ fmt.Println("[sendLoop][new connect2]", f.sid, len(streamQueues))
 				}
 
 			default:
-//fmt.Println("[sendLoop][force writes]", f.sid, f.cmd)
 				writes <- request
 				continue
 			}
 
-//fmt.Println("[sendLoop][trigger robin]", f.sid, f.cmd)
 			select {
 			case writeNotify <- struct{}{}:
 			default:
