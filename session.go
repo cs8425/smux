@@ -209,9 +209,9 @@ func (s *Session) SetDeadline(t time.Time) error {
 }
 
 // notify the session that a stream has closed
-func (s *Session) streamClosed(sid uint32) {
+func (s *Session) streamClosed(sid uint32, n int) {
 	s.streamLock.Lock()
-	if n := s.streams[sid].recycleTokens(); n > 0 { // return remaining tokens to the bucket
+	if n > 0 { // return remaining tokens to the bucket
 		if atomic.AddInt32(&s.bucket, int32(n)) > 0 {
 			s.notifyBucket()
 		}
@@ -281,8 +281,10 @@ func (s *Session) recvLoop() {
 			case cmdFIN:
 				s.streamLock.Lock()
 				if stream, ok := s.streams[f.sid]; ok {
-					stream.markRST()
-					stream.notifyReadEvent()
+					if stream.markRST() {
+						stream.notifyReadEvent()
+					}
+					delete(s.streams, f.sid)
 				}
 				s.streamLock.Unlock()
 			case cmdPSH:

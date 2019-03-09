@@ -1108,10 +1108,7 @@ func TestReadStreamAfterStreamCloseButRemainData(t *testing.T) {
 }
 
 func TestReadStreamAfterStreamCloseButRemainDataPipe(t *testing.T) {
-	s1, s2, err := getSmuxStreamPairPipe(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s1, s2, _ := getSmuxStreamPairPipe(nil)
 	testReadStreamAfterStreamCloseButRemainData(t, s1, s2)
 }
 
@@ -1156,6 +1153,105 @@ func testReadStreamAfterStreamCloseButRemainData(t *testing.T, s1 *Stream, s2 *S
 	if _, err := s2.Read(buf); err == nil {
 		t.Fatal("no error after close and no remain data")
 	}
+}
+
+func TestStreamCloseThenWrite(t *testing.T) {
+	s1, s2, _ := getSmuxStreamPairPipe(nil)
+	defer s1.Close()
+	s2.Close()
+
+	_, err := s2.Write([]byte("hello"))
+	if err == nil {
+		t.Fatal("should not write after Close()")
+	}
+}
+
+func TestStreamHalfCloseThenWrite(t *testing.T) {
+	s1, s2, _ := getSmuxStreamPairPipe(nil)
+	defer s1.Close()
+	defer s2.Close()
+	s2.CloseWrite()
+
+	_, err := s2.Write([]byte("hello"))
+	if err == nil {
+		t.Fatal("should not write after CloseWrite()")
+	}
+}
+
+func TestStreamHalfCloseThenRead(t *testing.T) {
+	s1, s2, _ := getSmuxStreamPairPipe(nil)
+	defer s1.Close()
+	defer s2.Close()
+	s2.CloseRead()
+
+	msg := []byte("hello")
+	_, err := s1.Write(msg)
+	if err != nil {
+		t.Fatal("cannot write")
+		return
+	}
+	s1.Close()
+
+	_, err = s2.Write(msg)
+	if err != nil {
+		t.Fatal("should write after CloseRead()")
+		return
+	}
+
+	buf := make([]byte, 10)
+	_, err = s2.Read(buf)
+	if err == nil {
+		t.Fatal("should not read after CloseRead()")
+	}
+}
+
+func TestStreamHalfClose(t *testing.T) {
+	s1, s2, _ := getSmuxStreamPairPipe(nil)
+	defer s1.Close()
+	defer s2.Close()
+
+	s2.CloseWrite() // s2 stop writting
+
+	const N = 10
+	var sent string
+	var received string
+
+	// send and immediately close
+	nsent := 0
+	for i := 0; i < N; i++ {
+		msg := fmt.Sprintf("hello%v", i)
+		sent += msg
+		n, err := s1.Write([]byte(msg))
+		if err != nil {
+			t.Fatal("cannot write")
+		}
+		nsent += n
+	}
+	s1.Close() // s1 stop writting & reading
+
+	// read out all remain data
+	buf := make([]byte, 10)
+	nrecv := 0
+	for nrecv < nsent {
+		n, err := s2.Read(buf)
+		if err == nil {
+			received += string(buf[:n])
+			nrecv += n
+		} else {
+			t.Fatal("cannot read remain data:", err)
+			break
+		}
+	}
+
+	if sent != received {
+		t.Fatal("data mimatch")
+	}
+
+	if _, err := s2.Read(buf); err == nil {
+		t.Fatal("no error after close and no remain data")
+	}
+	s2.Close()
+
 }
 
 func BenchmarkAcceptClose(b *testing.B) {

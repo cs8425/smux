@@ -18,7 +18,9 @@ type Stream struct {
 	bufferLock    sync.Mutex
 	frameSize     int
 	chReadEvent   chan struct{} // notify a read event
-	die           chan struct{} // flag the stream has closed
+	die           chan struct{} // flag the stream has closed read & write
+	dieW          chan struct{} // flag the stream has closed write
+	dieR          chan struct{} // flag the stream has closed read
 	dieLock       sync.Mutex
 	readDeadline  atomic.Value
 	writeDeadline atomic.Value
@@ -44,6 +46,8 @@ func newStream(id uint32, frameSize int, sess *Session) *Stream {
 	s.frameSize = frameSize
 	s.sess = sess
 	s.die = make(chan struct{})
+	s.dieW = make(chan struct{})
+	s.dieR = make(chan struct{})
 
 	s.bucket = int32(0)
 	s.bucketNotify = make(chan struct{}, 1)
@@ -65,6 +69,8 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		select {
 		case <-s.die:
+			return 0, ErrBrokenPipe
+		case <-s.dieR:
 			return 0, ErrBrokenPipe
 		default:
 			return 0, nil
@@ -102,6 +108,8 @@ READ:
 		return n, errTimeout
 	case <-s.die:
 		return 0, ErrBrokenPipe
+	case <-s.dieR:
+		return 0, ErrBrokenPipe
 	}
 }
 
@@ -115,6 +123,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	}
 
 	select {
+	case <-s.dieW:
+		return 0, ErrBrokenPipe
 	case <-s.die:
 		return 0, ErrBrokenPipe
 	default:
@@ -140,6 +150,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 
 		select {
 		case s.sess.writes <- req:
+		case <-s.dieW:
+			return sent, ErrBrokenPipe
 		case <-s.die:
 			return sent, ErrBrokenPipe
 		case <-deadline:
@@ -152,6 +164,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 			if result.err != nil {
 				return sent, result.err
 			}
+		case <-s.dieW:
+			return sent, ErrBrokenPipe
 		case <-s.die:
 			return sent, ErrBrokenPipe
 		case <-deadline:
@@ -163,6 +177,15 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 
 // Close implements net.Conn
 func (s *Stream) Close() error {
+	err := s.CloseWrite()
+	if err != nil {
+		return err
+	}
+	err = s.CloseRead()
+	if err != nil {
+		return err
+	}
+
 	s.dieLock.Lock()
 
 	select {
@@ -175,8 +198,35 @@ func (s *Stream) Close() error {
 	default:
 		close(s.die)
 		s.dieLock.Unlock()
-		_, err := s.sess.writeFrame(newFrame(cmdFIN, s.id))
-		s.sess.streamClosed(s.id)
+		return nil
+	}
+}
+
+func (s *Stream) CloseRead() error {
+	s.dieLock.Lock()
+
+	select {
+	case <-s.dieR:
+		s.dieLock.Unlock()
+	default:
+		close(s.dieR)
+		s.dieLock.Unlock()
+		s.sess.streamClosed(s.id, s.recycleTokens()) // remove from recv map & return remaining tokens to the session bucket
+	}
+	return nil
+}
+
+func (s *Stream) CloseWrite() error {
+	s.dieLock.Lock()
+
+	select {
+	case <-s.dieW:
+		s.dieLock.Unlock()
+		return nil
+	default:
+		close(s.dieW)
+		s.dieLock.Unlock()
+		_, err := s.sess.writeFrame(newFrame(cmdFIN, s.id)) // notify other side no more data
 		return err
 	}
 }
@@ -319,8 +369,8 @@ func (s *Stream) notifyReadEvent() {
 }
 
 // mark this stream has been reset
-func (s *Stream) markRST() {
-	atomic.StoreInt32(&s.rstflag, 1)
+func (s *Stream) markRST() bool {
+	return atomic.CompareAndSwapInt32(&s.rstflag, 0, 1)
 }
 
 // mark this stream has been pause write
