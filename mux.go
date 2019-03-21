@@ -1,7 +1,6 @@
 package smux
 
 import (
-	"fmt"
 	"io"
 	"time"
 
@@ -30,7 +29,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		KeepAliveInterval: 10 * time.Second,
-		KeepAliveTimeout:  30 * time.Second,
+		KeepAliveTimeout:  5 * time.Second,
 		MaxFrameSize:      32768,
 		MaxReceiveBuffer:  4194304,
 	}
@@ -40,9 +39,6 @@ func DefaultConfig() *Config {
 func VerifyConfig(config *Config) error {
 	if config.KeepAliveInterval == 0 {
 		return errors.New("keep-alive interval must be positive")
-	}
-	if config.KeepAliveTimeout < config.KeepAliveInterval {
-		return fmt.Errorf("keep-alive timeout must be larger than keep-alive interval")
 	}
 	if config.MaxFrameSize <= 0 {
 		return errors.New("max frame size must be positive")
