@@ -22,6 +22,7 @@ type Stream struct {
 	dieLock       sync.Mutex
 	readDeadline  atomic.Value
 	writeDeadline atomic.Value
+	writeLock     sync.Mutex
 }
 
 // newStream initiates a Stream struct
@@ -98,6 +99,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 
 	frames := s.split(b, cmdPSH, s.id)
 	sent := 0
+	s.writeLock.Lock()
+	defer s.writeLock.Unlock()
 	for k := range frames {
 		req := writeRequest{
 			frame:  frames[k],
@@ -139,7 +142,9 @@ func (s *Stream) Close() error {
 		close(s.die)
 		s.dieLock.Unlock()
 		s.sess.streamClosed(s.id)
+		s.writeLock.Lock()
 		_, err := s.sess.writeFrame(newFrame(cmdFIN, s.id))
+		s.writeLock.Unlock()
 		return err
 	}
 }
